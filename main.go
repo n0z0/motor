@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha512"
 	"encoding/base32"
 	"fmt"
 	"log"
@@ -32,15 +33,12 @@ func (w *torLogWriter) Write(p []byte) (n int, err error) {
 	// Tampilkan log aslinya ke layar dengan prefix [TOR]
 	fmt.Print("[TOR DEBUG] ", msg)
 
-	// Deteksi event krusial (disesuaikan dengan format output terbaru)
+	// Deteksi event krusial
 	if strings.Contains(msg, "BOOTSTRAP PROGRESS=100") || strings.Contains(msg, "Bootstrapped 100%") {
 		fmt.Println("\n======================================================================")
 		fmt.Println(" ✅ [SUCCESS] KONEKSI TOR UTAMA BERHASIL (BOOTSTRAP 100%)")
-		fmt.Println("======================================================================")
-	} else if strings.Contains(msg, "Uploaded rendezvous descriptor") {
-		fmt.Println("\n======================================================================")
-		fmt.Println(" 🚀 [LIVE STATUS] DESCRIPTOR ONION BERHASIL DI-UPLOAD KE JARINGAN GLOBAL!")
-		fmt.Println(" 🌐 ALAMAT ONION ANDA SEKARANG SUDAH BISA DIAKSES DI TOR BROWSER.")
+		fmt.Println(" 🚀 Alamat Anda sedang dipublikasikan ke jaringan global secara background.")
+		fmt.Println(" ⏳ Tunggu sekitar 2 menit dari sekarang, lalu buka Tor Browser Anda!")
 		fmt.Println("======================================================================")
 	} else if strings.Contains(msg, "Failed to load") {
 		fmt.Println("\n ❌ [ERROR] Tor mendeteksi masalah pada Kunci atau Konfigurasi!")
@@ -112,13 +110,13 @@ func main() {
 
 	fmt.Println("Menyiapkan folder proxy portabel...")
 
-	hsDir, err := os.MkdirTemp("", "onion_hs_dir_*")
+	hsDir, err := os.MkdirTemp(".", "onion_hs_dir_*")
 	if err != nil {
 		log.Fatalf("Gagal membuat folder sementara: %v", err)
 	}
 	defer os.RemoveAll(hsDir)
 
-	torDataDir, err := os.MkdirTemp("", "tor_data_dir_*")
+	torDataDir, err := os.MkdirTemp(".", "tor_data_dir_*")
 	if err != nil {
 		log.Fatalf("Gagal membuat folder data Tor: %v", err)
 	}
@@ -127,21 +125,38 @@ func main() {
 	os.Chmod(hsDir, 0700)
 	os.Chmod(torDataDir, 0700)
 
+	// === PERBAIKAN FORMAT KUNCI (TOR EXPANDED KEY FORMAT) ===
 	keyDataUtuh, err := os.ReadFile("hs_ed25519_secret_key")
 	if err != nil {
 		log.Fatalf("Gagal membaca file kunci lokal: %v", err)
 	}
+
+	// Vanity generator kita menyimpan: 32-byte Header + 32-byte Seed + 32-byte PubKey (standar Go)
+	// Tor (C implementation) membutuhkan: 32-byte Header + 64-byte Expanded Secret Key
+	seed := keyDataUtuh[32:64] // Ambil 32-byte pertama dari private key (yaitu Seed)
+
+	// Melakukan ekspansi rahasia menggunakan SHA-512 & RFC 8032 Clamping
+	expandedSecret := sha512.Sum512(seed)
+	expandedSecret[0] &= 248
+	expandedSecret[31] &= 127
+	expandedSecret[31] |= 64
+
+	// Merakit ulang kunci dengan format yang bisa dibaca Tor
+	var correctTorKey []byte
+	correctTorKey = append(correctTorKey, keyDataUtuh[:32]...) // Copy header "== ed25519v1-secret..."
+	correctTorKey = append(correctTorKey, expandedSecret[:]...)
+
+	// Simpan kunci yang sudah dikoreksi ke folder temporary
 	keyPath := filepath.Join(hsDir, "hs_ed25519_secret_key")
-	err = os.WriteFile(keyPath, keyDataUtuh, 0600)
+	err = os.WriteFile(keyPath, correctTorKey, 0600)
 	if err != nil {
 		log.Fatalf("Gagal menyalin kunci ke folder sementara: %v", err)
 	}
+	// =========================================================
 
 	var args []string
 	cleanHsDir := filepath.ToSlash(hsDir)
 	args = append(args, "--HiddenServiceDir", cleanHsDir)
-
-	// Memaksa Tor untuk menampilkan log [notice] meskipun bine menyuntikkan --hush
 	args = append(args, "--Log", "notice stdout")
 
 	fmt.Println("\n=== DIAGNOSTIK KONEKSI LOKAL ===")
@@ -206,7 +221,6 @@ func main() {
 	fmt.Printf("====================================================\n\n")
 
 	fmt.Println("⏳ PERHATIAN: Jaringan Tor membutuhkan waktu 2 hingga 3 menit untuk mempublikasikan alamat Anda.")
-	fmt.Println("⏳ Tolong PERHATIKAN LOG DEBUG di atas. Tunggu sampai muncul pesan 'DESCRIPTOR BERHASIL DI-UPLOAD'...")
 	fmt.Println("\nAplikasi proxy sedang berjalan. Tekan Ctrl+C untuk mematikan.\n")
 
 	sigCh := make(chan os.Signal, 1)
