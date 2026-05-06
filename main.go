@@ -22,6 +22,7 @@ import (
 // Format: OnionPort -> "IP_Lokal:Port_Lokal"
 var portMappings = map[int]string{
 	80:    "192.168.1.10:80",    // Meneruskan akses web (Port 80) ke Web UI Dahua
+	443:   "192.168.1.10:443",   // Tambahkan port HTTPS
 	37777: "192.168.1.10:37777", // Meneruskan port TCP Stream Dahua (agar video tidak blank)
 }
 
@@ -134,7 +135,7 @@ func main() {
 			hasError = true
 		}
 	}
-	fmt.Println("================================\n")
+	fmt.Println("================================")
 
 	if hasError {
 		fmt.Println("⚠️  PERINGATAN: Satu atau lebih target tidak bisa dihubungi dari komputer ini.")
