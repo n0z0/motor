@@ -18,31 +18,55 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
+// torLogWriter adalah custom logger untuk mencegat dan menganalisa log internal Tor
+type torLogWriter struct{}
+
+func (w *torLogWriter) Write(p []byte) (n int, err error) {
+	msg := string(p)
+
+	// Abaikan warning bawaan Windows yang tidak penting agar layar tidak penuh
+	if strings.Contains(msg, "is relative and will resolve to") || strings.Contains(msg, "Read line: 250") {
+		return len(p), nil
+	}
+
+	// Tampilkan log aslinya ke layar dengan prefix [TOR]
+	fmt.Print("[TOR DEBUG] ", msg)
+
+	// Deteksi event krusial (disesuaikan dengan format output terbaru)
+	if strings.Contains(msg, "BOOTSTRAP PROGRESS=100") || strings.Contains(msg, "Bootstrapped 100%") {
+		fmt.Println("\n======================================================================")
+		fmt.Println(" ✅ [SUCCESS] KONEKSI TOR UTAMA BERHASIL (BOOTSTRAP 100%)")
+		fmt.Println("======================================================================")
+	} else if strings.Contains(msg, "Uploaded rendezvous descriptor") {
+		fmt.Println("\n======================================================================")
+		fmt.Println(" 🚀 [LIVE STATUS] DESCRIPTOR ONION BERHASIL DI-UPLOAD KE JARINGAN GLOBAL!")
+		fmt.Println(" 🌐 ALAMAT ONION ANDA SEKARANG SUDAH BISA DIAKSES DI TOR BROWSER.")
+		fmt.Println("======================================================================")
+	} else if strings.Contains(msg, "Failed to load") {
+		fmt.Println("\n ❌ [ERROR] Tor mendeteksi masalah pada Kunci atau Konfigurasi!")
+	}
+
+	return len(p), nil
+}
+
 // Konfigurasi Port Mapping (Ubah bagian ini sesuai kebutuhan LAN Anda!)
-// Format: OnionPort -> "IP_Lokal:Port_Lokal"
 var portMappings = map[int]string{
 	80:    "192.168.1.10:80",    // Meneruskan akses web (Port 80) ke Web UI Dahua
-	443:   "192.168.1.10:443",   // Tambahkan port HTTPS
+	443:   "192.168.1.10:443",   // Meneruskan HTTPS (jika Dahua melakukan redirect otomatis)
 	37777: "192.168.1.10:37777", // Meneruskan port TCP Stream Dahua (agar video tidak blank)
 }
 
-// loadPrivateKey membaca file rahasia Tor dan membuang 32-byte header
 func loadPrivateKey(filename string) (ed25519.PrivateKey, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
-
 	if len(data) != 96 {
 		return nil, fmt.Errorf("format atau panjang file kunci tidak valid")
 	}
-
-	// Mengambil 64 byte terakhir sebagai private key
-	privKey := ed25519.PrivateKey(data[32:])
-	return privKey, nil
+	return ed25519.PrivateKey(data[32:]), nil
 }
 
-// generateOnionAddress menghitung ulang alamat .onion dari public key untuk ditampilkan
 func generateOnionAddress(pubKey ed25519.PublicKey) string {
 	version := []byte{0x03}
 	prefix := []byte(".onion checksum")
@@ -62,20 +86,18 @@ func generateOnionAddress(pubKey ed25519.PublicKey) string {
 	addrBytes = append(addrBytes, checksum...)
 	addrBytes = append(addrBytes, version...)
 
-	encoded := base32.StdEncoding.EncodeToString(addrBytes)
-	return strings.ToLower(encoded)
+	return strings.ToLower(base32.StdEncoding.EncodeToString(addrBytes))
 }
 
-// checkTarget melakukan simulasi koneksi TCP untuk memastikan target aktif
 func checkTarget(address string) bool {
 	timeout := 2 * time.Second
 	conn, err := net.DialTimeout("tcp", address, timeout)
 	if err != nil {
-		return false // Tidak bisa terhubung
+		return false
 	}
 	if conn != nil {
 		conn.Close()
-		return true // Berhasil terhubung
+		return true
 	}
 	return false
 }
@@ -83,26 +105,28 @@ func checkTarget(address string) bool {
 func main() {
 	fmt.Println("Membaca private key...")
 
-	// Baca untuk perhitungan ekstrak address di CLI
 	privKey, err := loadPrivateKey("hs_ed25519_secret_key")
 	if err != nil {
 		log.Fatalf("Gagal mengekstrak kunci: %v", err)
 	}
 
-	// === PENDEKATAN VIRTUAL TORRC ===
 	fmt.Println("Menyiapkan folder proxy portabel...")
 
-	// 1. Buat folder temporary (sementara) yang otomatis dihapus nanti
-	hsDir, err := os.MkdirTemp("", "onion_hs_*")
+	hsDir, err := os.MkdirTemp("", "onion_hs_dir_*")
 	if err != nil {
 		log.Fatalf("Gagal membuat folder sementara: %v", err)
 	}
-	defer os.RemoveAll(hsDir) // Pembersihan saat aplikasi mati
+	defer os.RemoveAll(hsDir)
 
-	// Pastikan folder di set 0700 (aturan ketat daemon Tor)
+	torDataDir, err := os.MkdirTemp("", "tor_data_dir_*")
+	if err != nil {
+		log.Fatalf("Gagal membuat folder data Tor: %v", err)
+	}
+	defer os.RemoveAll(torDataDir)
+
 	os.Chmod(hsDir, 0700)
+	os.Chmod(torDataDir, 0700)
 
-	// 2. Salin file kunci utuh ke dalam folder sementara tersebut
 	keyDataUtuh, err := os.ReadFile("hs_ed25519_secret_key")
 	if err != nil {
 		log.Fatalf("Gagal membaca file kunci lokal: %v", err)
@@ -113,11 +137,12 @@ func main() {
 		log.Fatalf("Gagal menyalin kunci ke folder sementara: %v", err)
 	}
 
-	// 3. Merangkai instruksi argument untuk Daemon Tor (Virtual Torrc)
 	var args []string
-	// Convert path ke slash format (menghindari error di Windows)
 	cleanHsDir := filepath.ToSlash(hsDir)
 	args = append(args, "--HiddenServiceDir", cleanHsDir)
+
+	// Memaksa Tor untuk menampilkan log [notice] meskipun bine menyuntikkan --hush
+	args = append(args, "--Log", "notice stdout")
 
 	fmt.Println("\n=== DIAGNOSTIK KONEKSI LOKAL ===")
 	hasError := false
@@ -135,40 +160,43 @@ func main() {
 			hasError = true
 		}
 	}
-	fmt.Println("================================")
+	fmt.Println("================================\n")
 
 	if hasError {
 		fmt.Println("⚠️  PERINGATAN: Satu atau lebih target tidak bisa dihubungi dari komputer ini.")
-		fmt.Println("⚠️  Tor akan tetap dijalankan, namun akses ke Onion dipastikan akan menghasilkan error ERR_SOCKS_CONNECTION_FAILED.")
-		fmt.Println("⚠️  Pastikan CCTV menyala, kabel LAN terhubung, dan tidak terblokir Windows Firewall.")
-		fmt.Println("-----------------------------------------------------------------------------------------")
-		time.Sleep(3 * time.Second) // Memberi waktu user membaca pesan error
+		time.Sleep(3 * time.Second)
 	}
 
-	fmt.Println("Memulai instance Tor terintegrasi (mohon tunggu beberapa detik)...")
-
-	// Mencari lokasi executable Tor secara otomatis
 	var torExePath string
 	if _, err := os.Stat("tor.exe"); err == nil {
-		torExePath = "tor.exe" // Gunakan yang ada di folder yang sama (Windows)
+		torExePath = "tor.exe"
 	} else if _, err := os.Stat("tor"); err == nil {
-		torExePath = "./tor" // Gunakan yang ada di folder yang sama (Linux/Mac)
+		torExePath = "./tor"
 	} else {
-		torExePath = "" // Biarkan kosong agar library mencari di environment PATH bawaan OS
+		torExePath = ""
 	}
 
-	// Start daemon Tor dengan extra arguments (tanpa libtor)
-	t, err := tor.Start(context.Background(), &tor.StartConf{
-		ExePath:   torExePath,
-		ExtraArgs: args,
+	debugLogger := &torLogWriter{}
+	ctx := context.Background()
+
+	t, err := tor.Start(ctx, &tor.StartConf{
+		ExePath:     torExePath,
+		DataDir:     torDataDir,
+		ExtraArgs:   args,
+		DebugWriter: debugLogger,
 	})
 	if err != nil {
-		fmt.Printf("\n[ERROR FATAL]\nProgram Tor tidak ditemukan!\nSilakan download Windows Expert Bundle dari https://www.torproject.org/download/tor/\nLalu ekstrak dan copy 'tor.exe' beserta semua file '.dll' ke folder project ini.\n\nDetail error: %v\n", err)
+		fmt.Printf("\n[ERROR FATAL]\nProgram Tor gagal memulai!\nPastikan Anda sudah mematikan proses 'tor.exe' yang nyangkut di Task Manager.\nAtau jalankan: taskkill /F /IM tor.exe\n\nDetail error: %v\n", err)
 		os.Exit(1)
 	}
 	defer t.Close()
 
-	// Hitung vanity address untuk ditampilkan di layar
+	fmt.Println("\n[SISTEM] Menghidupkan jaringan Tor dan memulai proses Bootstrap...")
+	err = t.EnableNetwork(ctx, true)
+	if err != nil {
+		log.Fatalf("Gagal menghidupkan jaringan Tor: %v", err)
+	}
+
 	pubKey := privKey.Public().(ed25519.PublicKey)
 	onionID := generateOnionAddress(pubKey)
 
@@ -178,10 +206,9 @@ func main() {
 	fmt.Printf("====================================================\n\n")
 
 	fmt.Println("⏳ PERHATIAN: Jaringan Tor membutuhkan waktu 2 hingga 3 menit untuk mempublikasikan alamat Anda.")
-	fmt.Println("⏳ Tolong TUNGGU SEBENTAR sebelum membuka alamat onion tersebut di Tor Browser...")
-	fmt.Println("\nAplikasi proxy sedang berjalan. Tekan Ctrl+C untuk mematikan.")
+	fmt.Println("⏳ Tolong PERHATIKAN LOG DEBUG di atas. Tunggu sampai muncul pesan 'DESCRIPTOR BERHASIL DI-UPLOAD'...")
+	fmt.Println("\nAplikasi proxy sedang berjalan. Tekan Ctrl+C untuk mematikan.\n")
 
-	// Menahan agar aplikasi Golang tidak langsung keluar (berhenti)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
