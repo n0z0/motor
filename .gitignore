@@ -7,10 +7,10 @@
 *.dll
 *.so
 *.dylib
-
+hs_ed25519_secret_key
 # Test binary, built with `go test -c`
 *.test
-
+data-dir-729737011
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*
